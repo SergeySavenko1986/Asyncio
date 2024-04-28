@@ -1,3 +1,5 @@
-aiosqlite3
-aiosmtplib
-more_itertools
+pytest
+aiohttp
+more-itertools
+sqlalchemy
+asyncpg

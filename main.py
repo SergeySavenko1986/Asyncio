@@ -1,58 +1,110 @@
 import asyncio
-import aiosqlite3
-import aiosmtplib
+from datetime import datetime
 
+from aiohttp import ClientSession
 from more_itertools import chunked
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
-MAX_MAILS = 25
+from db import Session, PersonModel, engine, Base
 
-MAIL_PARAMS = {
-    'host': '127.0.0.1',
-    'port': 1025,
-    'mailfrom': 'test@example.com'
-}
+CHUNK_SIZE = 10
+PEOPLE_COUNT = 200
 
 
-async def db_contacts():
-    async with aiosqlite3.connect('contacts.db') as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT * FROM contacts;")
-            list_contacts = await cur.fetchall()
-    return list_contacts
+async def chunked_async(async_iter, size):
+    buffer = []
+    while True:
+        try:
+            item = await async_iter.__anext__()
+        except StopAsyncIteration:
+            break
+        buffer.append(item)
+        if len(buffer) == size:
+            yield buffer
+            buffer = []
 
 
-async def sendmail_async(mailto, name, **params):
-    mail_params = params.get("mail_params", MAIL_PARAMS)
-    msg = MIMEMultipart()
-    msg['Subject'] = "Вот спасибки, так спасибки!"
-    msg['From'] = mail_params.get('mailfrom')
-    msg['To'] = mailto
+async def get_deep_url(url, key, session):
+    async with session.get(f'{url}') as response:
+        data = await response.json()
+        return data[key]
 
-    body = f'''Уважаемый {name}!
-Спасибо, что пользуетесь нашим сервисом объявлений.'''
 
-    msg.attach(MIMEText(body, 'plain'))
+async def get_deep_urls(urls, key, session):
+    tasks = (asyncio.create_task(get_deep_url(url, key, session)) for url in urls)
+    for task in tasks:
+        yield await task
 
-    host = mail_params.get('host', 'localhost')
-    port = mail_params.get('port')
-    smtp = aiosmtplib.SMTP(hostname=host, port=port)
-    await smtp.connect()
-    result = await smtp.send_message(msg)
-    await smtp.quit()
-    return result
+
+async def get_deep_data(urls, key, session):
+    result_list = []
+    async for item in get_deep_urls(urls, key, session):
+        result_list.append(item)
+    return ', '.join(result_list)
+
+
+async def insert_people(people_chunk):
+    async with Session() as session:
+        async with ClientSession() as session_deep:
+            for person_json in people_chunk:
+                if person_json.get('status') == 404:
+                    break
+                # print(' --> import..', person_json['url'], person_json)
+                homeworld_str = await get_deep_data([person_json['homeworld']], 'name', session_deep)
+                films_str = await get_deep_data(person_json['films'], 'title', session_deep)
+                species_str = await get_deep_data(person_json['species'], 'name', session_deep)
+                starships_str = await get_deep_data(person_json['starships'], 'name', session_deep)
+                vehicles_str = await get_deep_data(person_json['vehicles'], 'name', session_deep)
+                newperson = PersonModel(
+                    birth_year=person_json['birth_year'],
+                    eye_color=person_json['eye_color'],
+                    gender=person_json['gender'],
+                    hair_color=person_json['hair_color'],
+                    height=person_json['height'],
+                    mass=person_json['mass'],
+                    name=person_json['name'],
+                    skin_color=person_json['skin_color'],
+                    homeworld=homeworld_str,
+                    films=films_str,
+                    species=species_str,
+                    starships=starships_str,
+                    vehicles=vehicles_str,
+                )
+                session.add(newperson)
+                await session.commit()
+
+
+async def get_person(person_id: int, session: ClientSession):
+    print(f'begin {person_id}')
+    async with session.get(f'https://swapi.dev/api/people/{person_id}') as response:
+        if response.status == 404:
+            return {'status': 404}
+        person = await response.json()
+        print(f'end {person_id}')
+        return person
+
+
+async def get_people():
+    async with ClientSession() as session:
+        for id_chunk in chunked(range(1, PEOPLE_COUNT), CHUNK_SIZE):
+            coroutines = [get_person(i, session=session) for i in id_chunk]
+            people = await asyncio.gather(*coroutines)
+            for item in people:
+                yield item
 
 
 async def main():
-    contacts = await db_contacts()
-    for contacts_chunk in chunked(contacts, MAX_MAILS):
-        sendmail_coroutines = [
-            sendmail_async(mailto=mailto, name=f'{first_name} {last_name}')
-            for _, first_name, last_name, mailto, *other in contacts_chunk
-        ]
-        await asyncio.gather(*sendmail_coroutines)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.commit()
+    async for chunk in chunked_async(get_people(), CHUNK_SIZE):
+        asyncio.create_task(insert_people(chunk))
+    tasks = set(asyncio.all_tasks()) - {asyncio.current_task()}
+    for task in tasks:
+        await task
 
 
 if __name__ == '__main__':
+    start = datetime.now()
     asyncio.run(main())
+    print(datetime.now() - start)
